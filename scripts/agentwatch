@@ -1,0 +1,623 @@
+#!/usr/bin/env bash
+#
+# agentwatch - know which of your tmux panes has an agent waiting on you
+#
+# Usage:
+#   agentwatch mark <state> [message]  Record a state transition (called from agent hooks)
+#   agentwatch seen [pane]             Acknowledge a pane (called from tmux focus hooks)
+#   agentwatch list                    Show the agent roster
+#   agentwatch status                  Status-line summary string
+#   agentwatch next                    Jump to the agent that has waited longest
+#   agentwatch menu                    Pick an agent from a tmux menu
+#   agentwatch switch                  Pick an agent with fzf
+#   agentwatch goto <pane-id>          Jump to a specific pane
+#   agentwatch reap                    Drop state for panes that no longer exist
+#   agentwatch hooks [--write]         Show (or install) the Claude Code hook config
+#   agentwatch doctor                  Diagnose the setup
+#
+# States: working | waiting | done | idle
+#
+# Deliberately not `set -e`: this runs inside agent hooks and must never
+# fail in a way that interrupts the agent.
+
+set -uo pipefail
+
+AGENTWATCH_DIR="${AGENTWATCH_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agentwatch}"
+
+# ── tmux plumbing ─────────────────────────────────────────────────────
+
+_have_tmux() { command -v tmux >/dev/null 2>&1; }
+
+# Read a tmux user option, falling back to a default.
+_opt() {
+    local value
+    value=$(tmux show-option -gqv "$1" 2>/dev/null)
+    if [[ -z $value ]]; then printf '%s' "$2"; else printf '%s' "$value"; fi
+}
+
+# Resolve which pane we are running in.
+#
+# $TMUX_PANE is inherited by anything the pane's shell spawns, including
+# agent hook processes, so it is the fast path. When it is missing (agent
+# launched outside tmux, or a wrapper scrubbed the environment) walk the
+# parent-PID chain and look for a PID tmux recognises as a pane's process.
+_resolve_pane() {
+    if [[ -n ${TMUX_PANE:-} ]]; then
+        printf '%s' "$TMUX_PANE"
+        return 0
+    fi
+
+    local panes pid ppid
+    panes=$(tmux list-panes -a -F '#{pane_pid} #{pane_id}' 2>/dev/null) || return 1
+    [[ -n $panes ]] || return 1
+
+    pid=$$
+    while [[ -n $pid && $pid -gt 1 ]]; do
+        local match
+        match=$(awk -v p="$pid" '$1 == p { print $2; exit }' <<< "$panes")
+        if [[ -n $match ]]; then
+            printf '%s' "$match"
+            return 0
+        fi
+        ppid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null)
+        [[ -n $ppid && $ppid != "$pid" ]] || return 1
+        pid=$ppid
+    done
+    return 1
+}
+
+_live_panes() { tmux list-panes -a -F '#{pane_id}' 2>/dev/null; }
+
+# ── State storage ─────────────────────────────────────────────────────
+#
+# One file per pane. Single tab-separated line:
+#   state <TAB> ts <TAB> working_ts <TAB> notified <TAB> label <TAB> message
+
+_state_file() {
+    mkdir -p "$AGENTWATCH_DIR" 2>/dev/null
+    printf '%s/pane-%s' "$AGENTWATCH_DIR" "${1//%/}"
+}
+
+# Populates S_state S_ts S_working_ts S_notified S_label S_msg
+_read_state() {
+    S_state=""; S_ts=0; S_working_ts=0; S_notified=0; S_label=""; S_msg=""
+    local f
+    f=$(_state_file "$1")
+    [[ -r $f ]] || return 0
+    IFS=$'\t' read -r S_state S_ts S_working_ts S_notified S_label S_msg < "$f" 2>/dev/null || true
+    [[ $S_ts         =~ ^[0-9]+$ ]] || S_ts=0
+    [[ $S_working_ts =~ ^[0-9]+$ ]] || S_working_ts=0
+    [[ $S_notified   =~ ^[01]$   ]] || S_notified=0
+}
+
+_write_state() {
+    # pane state ts working_ts notified label msg
+    local f
+    f=$(_state_file "$1")
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$2" "$3" "$4" "$5" "$(_flatten "$6")" "$(_flatten "$7")" > "$f"
+}
+
+# Tabs and newlines would corrupt the record.
+_flatten() { printf '%s' "${1:-}" | tr '\t\n' '  ' | cut -c1-200; }
+
+_now() { date +%s; }
+
+# ── Presentation ──────────────────────────────────────────────────────
+
+_glyph_for() {
+    case "$1" in
+        waiting) _opt @agentwatch-glyph-waiting '●' ;;
+        done)    _opt @agentwatch-glyph-done    '✔' ;;
+        working) _opt @agentwatch-glyph-working '…' ;;
+        *)       printf '' ;;
+    esac
+}
+
+_color_for() {
+    case "$1" in
+        waiting) _opt @agentwatch-color-waiting 'yellow' ;;
+        done)    _opt @agentwatch-color-done    'green' ;;
+        working) _opt @agentwatch-color-working 'brightblack' ;;
+        *)       printf 'default' ;;
+    esac
+}
+
+# Higher wins when several panes share a window.
+_rank_for() {
+    case "$1" in
+        waiting) printf 3 ;;
+        done)    printf 2 ;;
+        working) printf 1 ;;
+        *)       printf 0 ;;
+    esac
+}
+
+_elapsed_human() {
+    local s=$1
+    if   (( s < 60 ));   then printf '%ds' "$s"
+    elif (( s < 3600 )); then printf '%dm' "$((s / 60))"
+    elif (( s < 86400 ));then printf '%dh%dm' "$((s / 3600))" "$(((s % 3600) / 60))"
+    else printf '%dd' "$((s / 86400))"
+    fi
+}
+
+# ── Option writing ────────────────────────────────────────────────────
+
+_set_pane_options() {
+    local pane=$1 state=$2 label=$3
+    tmux set-option -p -t "$pane" @agentwatch_state "$state"        2>/dev/null
+    tmux set-option -p -t "$pane" @agentwatch_glyph "$(_glyph_for "$state")" 2>/dev/null
+    tmux set-option -p -t "$pane" @agentwatch_color "$(_color_for "$state")" 2>/dev/null
+    tmux set-option -p -t "$pane" @agentwatch_label "$label"        2>/dev/null
+}
+
+# A window shows the most urgent state among its panes. Window options are
+# used for the status line because pane options nested inside #{W:...} do
+# not aggregate reliably.
+_refresh_window() {
+    local pane=$1 win best_state best_rank=0
+    win=$(tmux display-message -p -t "$pane" '#{window_id}' 2>/dev/null) || return 0
+    [[ -n $win ]] || return 0
+
+    best_state=""
+    while read -r p_state; do
+        local rank
+        rank=$(_rank_for "$p_state")
+        if (( rank > best_rank )); then
+            best_rank=$rank
+            best_state=$p_state
+        fi
+    done < <(tmux list-panes -t "$win" -F '#{@agentwatch_state}' 2>/dev/null)
+
+    tmux set-option -w -t "$win" @agentwatch_state "$best_state"        2>/dev/null
+    tmux set-option -w -t "$win" @agentwatch_glyph "$(_glyph_for "$best_state")" 2>/dev/null
+    tmux set-option -w -t "$win" @agentwatch_color "$(_color_for "$best_state")" 2>/dev/null
+}
+
+# ── Notification ──────────────────────────────────────────────────────
+
+# Is the user currently looking at this pane?
+_is_focused() {
+    local v
+    v=$(tmux display-message -p -t "$1" \
+        '#{&&:#{pane_active},#{&&:#{window_active},#{session_attached}}}' 2>/dev/null)
+    [[ $v == 1 ]]
+}
+
+_notify() {
+    local title=$1 body=$2 urgency=$3 mode custom
+    mode=$(_opt @agentwatch-notify 'auto')
+    [[ $mode == off ]] && return 0
+
+    custom=$(_opt @agentwatch-notify-command '')
+    if [[ -n $custom ]]; then
+        bash -c "$custom" agentwatch-notify "$title" "$body" "$urgency" >/dev/null 2>&1 &
+        return 0
+    fi
+
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send -a tmux-agentwatch -u "$urgency" "$title" "$body" >/dev/null 2>&1 &
+    else
+        tmux display-message -d 3000 "$title — $body" 2>/dev/null
+    fi
+}
+
+# Decide whether this transition deserves the user's attention.
+# Expects S_* from a _read_state call on the *previous* record.
+_maybe_notify() {
+    local pane=$1 state=$2 label=$3 msg=$4 working_ts=$5 now=$6
+
+    case "$state" in
+        waiting|done) ;;
+        *) return 1 ;;
+    esac
+
+    # Already told them about this exact state.
+    [[ $S_state == "$state" && $S_notified == 1 ]] && return 1
+
+    # They are staring right at it.
+    _is_focused "$pane" && return 1
+
+    # A turn that ended in a couple of seconds was not worth interrupting for.
+    if [[ $state == done ]]; then
+        local threshold=$(( $(_opt @agentwatch-done-threshold 30) ))
+        if (( working_ts > 0 && now - working_ts < threshold )); then
+            return 1
+        fi
+    fi
+
+    local title body urgency
+    title="agent: ${label:-?}"
+    if [[ $state == waiting ]]; then
+        body="${msg:-waiting for your response}"
+        urgency=critical
+    else
+        body="${msg:-finished}"
+        urgency=normal
+    fi
+    if (( working_ts > 0 )); then
+        body="$body ($(_elapsed_human $((now - working_ts))))"
+    fi
+
+    _notify "$title" "$body" "$urgency"
+    return 0
+}
+
+# ── Commands ──────────────────────────────────────────────────────────
+
+cmd_mark() {
+    local state="${1:-}"
+    case "$state" in
+        working|waiting|done|idle) ;;
+        *) echo "agentwatch: unknown state '${state}' (working|waiting|done|idle)" >&2; return 1 ;;
+    esac
+    shift || true
+
+    _have_tmux || return 0
+
+    local pane
+    pane=$(_resolve_pane) || return 0
+
+    local msg="${*:-}" cwd=""
+
+    # Claude Code delivers a JSON payload on stdin. Optional nicety, so only
+    # bother when jq is around, and never block waiting for it.
+    if [[ ! -t 0 ]] && command -v jq >/dev/null 2>&1; then
+        local payload
+        payload=$(timeout 1 cat 2>/dev/null || true)
+        if [[ -n $payload ]]; then
+            [[ -z $msg ]] && msg=$(jq -r '.message // empty' <<< "$payload" 2>/dev/null)
+            cwd=$(jq -r '.cwd // empty' <<< "$payload" 2>/dev/null)
+        fi
+    fi
+
+    [[ -z $cwd ]] && cwd=$(tmux display-message -p -t "$pane" '#{pane_current_path}' 2>/dev/null)
+    local label="${cwd##*/}"
+
+    local now working_ts notified
+    now=$(_now)
+
+    _read_state "$pane"            # previous record; _maybe_notify reads S_*
+    [[ -n $label ]] || label=$S_label
+
+    if [[ $state == working ]]; then
+        working_ts=$now
+    else
+        working_ts=$S_working_ts
+    fi
+
+    notified=0
+    if _maybe_notify "$pane" "$state" "$label" "$msg" "$working_ts" "$now"; then
+        notified=1
+    elif [[ $S_state == "$state" ]]; then
+        notified=$S_notified       # unchanged state keeps its notified flag
+    fi
+
+    _write_state "$pane" "$state" "$now" "$working_ts" "$notified" "$label" "$msg"
+    _set_pane_options "$pane" "$state" "$label"
+    _refresh_window "$pane"
+    tmux refresh-client -S 2>/dev/null
+    return 0
+}
+
+# Acknowledge: the user has looked at this pane, so stop flagging it.
+cmd_seen() {
+    _have_tmux || return 0
+    [[ $(_opt @agentwatch-clear-on-focus 'on') == on ]] || return 0
+
+    local pane="${1:-}"
+    if [[ -z $pane ]]; then
+        pane=$(tmux display-message -p '#{pane_id}' 2>/dev/null)
+    fi
+    [[ -n $pane ]] || return 0
+
+    _read_state "$pane"
+
+    # The pane option is the thing the user actually sees, so trust it when no
+    # record exists — otherwise a wiped state dir leaves a glyph stuck on
+    # screen with nothing able to clear it.
+    if [[ -z $S_state ]]; then
+        S_state=$(tmux display-message -p -t "$pane" '#{@agentwatch_state}' 2>/dev/null)
+    fi
+
+    local new
+    case "$S_state" in
+        waiting) new=working ;;   # you are dealing with it now
+        done)    new=idle ;;      # nothing left to report
+        *) return 0 ;;
+    esac
+
+    _write_state "$pane" "$new" "$(_now)" "$S_working_ts" 0 "$S_label" ""
+    _set_pane_options "$pane" "$new" "$S_label"
+    _refresh_window "$pane"
+    tmux refresh-client -S 2>/dev/null
+    return 0
+}
+
+# Emits: pane_id <TAB> state <TAB> ts <TAB> target <TAB> label
+# Sorted most-urgent-first, then longest-waiting-first.
+_roster() {
+    local live now
+    live=$(_live_panes) || return 1
+    [[ -n $live ]] || return 0
+    now=$(_now)
+
+    local f pane
+    for f in "$AGENTWATCH_DIR"/pane-*; do
+        [[ -e $f ]] || continue
+        pane="%${f##*/pane-}"
+
+        if ! grep -qxF "$pane" <<< "$live"; then
+            rm -f "$f"
+            continue
+        fi
+
+        _read_state "$pane"
+        [[ -n $S_state && $S_state != idle ]] || continue
+
+        local target rank
+        target=$(tmux display-message -p -t "$pane" '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null)
+        rank=$(_rank_for "$S_state")
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$rank" "$pane" "$S_state" "$((now - S_ts))" "$target" "$S_label"
+    done | sort -k1,1nr -k4,4nr | cut -f2-
+}
+
+cmd_list() {
+    _have_tmux || { echo "agentwatch: tmux not found" >&2; return 1; }
+
+    local roster
+    roster=$(_roster)
+    if [[ -z $roster ]]; then
+        echo "agentwatch: no agents tracked"
+        return 0
+    fi
+
+    local i=1 pane state age target label
+    while IFS=$'\t' read -r pane state age target label; do
+        printf "  %d  %-2s %-8s %6s  %-20s %s\n" \
+            "$i" "$(_glyph_for "$state")" "$state" "$(_elapsed_human "$age")" "$target" "$label"
+        ((i++))
+    done <<< "$roster"
+}
+
+cmd_status() {
+    _have_tmux || return 0
+
+    local waiting=0 done_=0 working=0 pane state age target label
+    while IFS=$'\t' read -r pane state age target label; do
+        [[ -n $state ]] || continue
+        case "$state" in
+            waiting) ((waiting++)) ;;
+            done)    ((done_++)) ;;
+            working) ((working++)) ;;
+        esac
+    done <<< "$(_roster)"
+
+    local out=""
+    (( waiting )) && out+="#[fg=$(_color_for waiting)]$(_glyph_for waiting)$waiting#[default] "
+    (( done_ ))   && out+="#[fg=$(_color_for done)]$(_glyph_for done)$done_#[default] "
+    if (( working )) && [[ $(_opt @agentwatch-status-show-working 'on') == on ]]; then
+        out+="#[fg=$(_color_for working)]$(_glyph_for working)$working#[default] "
+    fi
+    printf '%s' "${out% }"
+}
+
+cmd_goto() {
+    local pane="${1:?Usage: agentwatch goto <pane-id>}"
+    _have_tmux || return 1
+
+    local sess win
+    sess=$(tmux display-message -p -t "$pane" '#{session_name}' 2>/dev/null) || return 1
+    win=$(tmux display-message -p -t "$pane" '#{window_id}' 2>/dev/null)
+    [[ -n $sess ]] || return 1
+
+    tmux switch-client -t "$sess" 2>/dev/null || true
+    tmux select-window -t "$win" 2>/dev/null
+    tmux select-pane -t "$pane" 2>/dev/null
+    cmd_seen "$pane"
+}
+
+cmd_next() {
+    local line
+    line=$(_roster | head -1)
+    if [[ -z $line ]]; then
+        tmux display-message "agentwatch: nothing waiting" 2>/dev/null
+        return 0
+    fi
+    cmd_goto "$(cut -f1 <<< "$line")"
+}
+
+cmd_menu() {
+    _have_tmux || return 1
+
+    local roster
+    roster=$(_roster)
+    if [[ -z $roster ]]; then
+        tmux display-message "agentwatch: no agents tracked" 2>/dev/null
+        return 0
+    fi
+
+    local self="${BASH_SOURCE[0]}"
+    local -a args=(display-menu -T ' agents ' -x C -y C)
+    local i=1 pane state age target label
+    while IFS=$'\t' read -r pane state age target label; do
+        (( i > 9 )) && break
+        args+=("$(printf '%-2s %-22s %-10s %s' \
+            "$(_glyph_for "$state")" "$target" "$(_elapsed_human "$age")" "$label")")
+        args+=("$i")
+        args+=("run-shell '\"$self\" goto $pane'")
+        ((i++))
+    done <<< "$roster"
+
+    tmux "${args[@]}"
+}
+
+cmd_switch() {
+    if ! command -v fzf >/dev/null 2>&1; then
+        echo "agentwatch: fzf is required for 'switch'" >&2
+        return 1
+    fi
+
+    local roster
+    roster=$(_roster)
+    if [[ -z $roster ]]; then
+        echo "agentwatch: no agents tracked"
+        return 0
+    fi
+
+    local rendered pane state age target label
+    rendered=""
+    while IFS=$'\t' read -r pane state age target label; do
+        rendered+=$(printf '%s\t%-2s %-8s %-12s %-24s %s' \
+            "$pane" "$(_glyph_for "$state")" "$state" "$(_elapsed_human "$age")" "$target" "$label")
+        rendered+=$'\n'
+    done <<< "$roster"
+
+    local choice
+    choice=$(printf '%s' "$rendered" \
+        | fzf --prompt='agent> ' --height=40% --reverse --with-nth=2.. --delimiter='\t') || return 0
+    [[ -n $choice ]] || return 0
+    cmd_goto "$(cut -f1 <<< "$choice")"
+}
+
+cmd_reap() {
+    _have_tmux || return 1
+    _roster >/dev/null      # _roster deletes records for dead panes
+    echo "agentwatch: reaped"
+}
+
+CLAUDE_HOOK_JSON='{
+  "hooks": {
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "AGENTWATCH_BIN mark working" }] }],
+    "Notification":     [{ "hooks": [{ "type": "command", "command": "AGENTWATCH_BIN mark waiting" }] }],
+    "Stop":             [{ "hooks": [{ "type": "command", "command": "AGENTWATCH_BIN mark done" }] }],
+    "SubagentStop":     [{ "hooks": [{ "type": "command", "command": "AGENTWATCH_BIN mark done" }] }]
+  }
+}'
+
+cmd_hooks() {
+    local self settings json
+    self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    settings="${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
+    json="${CLAUDE_HOOK_JSON//AGENTWATCH_BIN/$self}"
+
+    if [[ ${1:-} != "--write" ]]; then
+        echo "# Merge into $settings:"
+        printf '%s\n' "$json"
+        echo
+        echo "# Or run: agentwatch hooks --write"
+        return 0
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "agentwatch: jq is required for --write" >&2
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$settings")"
+    [[ -f $settings ]] || echo '{}' > "$settings"
+
+    local backup
+    backup="${settings}.agentwatch-backup"
+    cp "$settings" "$backup" || return 1
+
+    local merged
+    # Existing hooks for these events are preserved; ours are appended. Any
+    # entry already pointing at this script is dropped first, so re-running
+    # --write updates rather than duplicates.
+    merged=$(jq --argjson add "$json" --arg self "$self" '
+        . as $orig
+        | reduce ($add.hooks | keys[]) as $event ($orig;
+            .hooks[$event] = (
+                ((.hooks[$event] // [])
+                    | map(.hooks |= map(select((.command // "") | startswith($self) | not)))
+                    | map(select((.hooks | length) > 0)))
+                + $add.hooks[$event]))
+    ' "$settings") || { echo "agentwatch: merge failed, $settings untouched" >&2; return 1; }
+
+    printf '%s\n' "$merged" > "$settings"
+    echo "agentwatch: hooks installed in $settings (backup: $backup)"
+}
+
+cmd_doctor() {
+    echo "agentwatch doctor"
+    echo "  script:        ${BASH_SOURCE[0]}"
+    echo "  state dir:     $AGENTWATCH_DIR"
+    if _have_tmux; then
+        echo "  tmux:          $(tmux -V)"
+    else
+        echo "  tmux:          NOT FOUND"
+        return 1
+    fi
+    echo "  \$TMUX_PANE:    ${TMUX_PANE:-unset (will fall back to PID walk)}"
+    local pane
+    if pane=$(_resolve_pane); then
+        echo "  resolved pane: $pane"
+    else
+        echo "  resolved pane: FAILED — 'mark' would be a no-op here"
+    fi
+    echo "  focus-events:  $(tmux show-option -gqv focus-events)"
+    echo "  notify mode:   $(_opt @agentwatch-notify 'auto')"
+    if [[ -n $(_opt @agentwatch-notify-command '') ]]; then
+        echo "  notify via:    @agentwatch-notify-command"
+    elif command -v notify-send >/dev/null 2>&1; then
+        echo "  notify via:    notify-send"
+    else
+        echo "  notify via:    tmux display-message (notify-send not found)"
+    fi
+    echo "  jq:            $(command -v jq || echo 'not found (hook messages disabled)')"
+    echo "  fzf:           $(command -v fzf || echo 'not found (switch disabled)')"
+    echo "  window deco:   $(tmux show-option -gqv window-status-format)"
+    echo "  tracked:"
+    cmd_list | sed 's/^/  /'
+}
+
+# ── Main ─────────────────────────────────────────────────────────────
+
+main() {
+    local cmd="${1:-}"
+    shift || true
+
+    case "$cmd" in
+        mark)      cmd_mark "$@" ;;
+        seen)      cmd_seen "$@" ;;
+        list|ls)   cmd_list "$@" ;;
+        status)    cmd_status "$@" ;;
+        next)      cmd_next "$@" ;;
+        menu)      cmd_menu "$@" ;;
+        switch|sw) cmd_switch "$@" ;;
+        goto)      cmd_goto "$@" ;;
+        reap)      cmd_reap "$@" ;;
+        hooks)     cmd_hooks "$@" ;;
+        doctor)    cmd_doctor "$@" ;;
+        ""|help|-h|--help)
+            cat << 'EOF'
+agentwatch - know which tmux pane has an agent waiting on you
+
+Usage:
+  agentwatch mark <state> [message]  Record a state transition (from agent hooks)
+  agentwatch seen [pane]             Acknowledge a pane, clearing its flag
+  agentwatch list                    Show the agent roster, most urgent first
+  agentwatch status                  Status-line summary string
+  agentwatch next                    Jump to whoever has waited longest
+  agentwatch menu                    Pick an agent from a tmux menu
+  agentwatch switch                  Pick an agent with fzf
+  agentwatch goto <pane-id>          Jump to a specific pane
+  agentwatch reap                    Drop state for panes that no longer exist
+  agentwatch hooks [--write]         Show (or install) the Claude Code hooks
+  agentwatch doctor                  Diagnose the setup
+
+States: working | waiting | done | idle
+State lives in $AGENTWATCH_DIR (default ~/.local/state/agentwatch)
+EOF
+            ;;
+        *)
+            echo "agentwatch: unknown command '$cmd' (try 'agentwatch help')" >&2
+            return 1
+            ;;
+    esac
+}
+
+main "$@"
