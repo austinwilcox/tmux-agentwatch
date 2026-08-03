@@ -13,6 +13,7 @@
 #
 #   set -g @agentwatch-decorate-windows "on"   # append a glyph to window-status-format
 #   set -g @agentwatch-clear-on-focus   "on"   # un-flag a pane once you look at it
+#   set -g @agentwatch-sound            "off"  # off | on | waiting | bell
 #
 # See readme.md for the full option list.
 

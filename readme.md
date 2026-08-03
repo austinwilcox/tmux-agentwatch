@@ -14,6 +14,14 @@ waiting longest.
   3  … working     8m  side:1.1             leftwm
 ```
 
+## Why
+
+I have grown accustomed to loving tmux. Plenty of tools exist for wrangling a
+fleet of agents — herdr and friends — but switching to one of them means giving
+up the multiplexer I already live in all day. Keeping track of where my agents
+are at, without leaving tmux, was a must. So this plugin brings the tracking to
+tmux instead of moving me somewhere else.
+
 ## Install
 
 ### With [TPM](https://github.com/tmux-plugins/tpm)
@@ -60,7 +68,8 @@ Each transition:
 - writes a record to `~/.local/state/agentwatch/pane-<id>`
 - sets `@agentwatch_state`, `@agentwatch_glyph`, `@agentwatch_color` and
   `@agentwatch_label` on the pane, and the most urgent of those on the window
-- fires a desktop notification, if the pane is not already on screen
+- fires a desktop notification, and a sound if you enabled one, when the pane is
+  not already on screen
 - refreshes the status line
 
 Looking at a flagged pane clears it — a `waiting` pane drops back to `working`,
@@ -82,6 +91,7 @@ agentwatch next                Jump to whoever has waited longest
 agentwatch menu                Pick an agent from a tmux menu
 agentwatch switch              Pick an agent with fzf
 agentwatch goto <pane-id>      Jump to a specific pane
+agentwatch sound [waiting|done] Play a state's sound, to test the setup
 agentwatch reap                Drop records for panes that no longer exist
 agentwatch hooks [--write]     Show or install the Claude Code hook config
 agentwatch doctor              Diagnose the setup
@@ -130,6 +140,10 @@ still working — and hides whichever counts are zero.
 | `@agentwatch-color-working` | `brightblack` | Colour for `working` |
 | `@agentwatch-notify` | `auto` | `auto`, `on`, or `off` |
 | `@agentwatch-notify-command` | — | Custom notifier; receives title, body, urgency as `$1 $2 $3` |
+| `@agentwatch-sound` | `off` | `off`, `on`, `waiting` (only when an agent wants you), or `bell` |
+| `@agentwatch-sound-waiting` | theme default | Sound file for `waiting` |
+| `@agentwatch-sound-done` | theme default | Sound file for `done` |
+| `@agentwatch-sound-command` | — | Custom player; receives the state as `$1` |
 | `@agentwatch-done-threshold` | `30` | Skip the `done` notification for turns shorter than this many seconds |
 | `@agentwatch-clear-on-focus` | `on` | Clear a pane's flag once you look at it |
 | `@agentwatch-decorate-windows` | `on` | Append the glyph to `window-status-format` |
@@ -140,6 +154,49 @@ Notifications go through `notify-send` when it is available and fall back to
 
 ```tmux
 set -g @agentwatch-notify-command 'terminal-notifier -title "$1" -message "$2"'
+```
+
+## Sound
+
+Off by default. Turn it on and you get a chime whenever an agent starts waiting
+on you or finishes a turn:
+
+```tmux
+set -g @agentwatch-sound "on"
+```
+
+`"waiting"` limits it to the case that actually needs you — an agent asking for
+permission or input — and stays quiet on `done`. `"bell"` sends the terminal bell
+instead of playing a file, which is the option that survives an SSH session.
+
+Sounds follow the same rules as notifications: nothing plays for a pane you are
+already looking at, for a state you have already been told about, or for a turn
+that finished inside `@agentwatch-done-threshold` seconds. `@agentwatch-notify
+off` silences the popups but leaves sound alone, so you can have one without the
+other.
+
+With no file paths configured, agentwatch uses the freedesktop sound theme on
+Linux and the system sounds on macOS. Override either state:
+
+```tmux
+set -g @agentwatch-sound-waiting "$HOME/sounds/ping.wav"
+set -g @agentwatch-sound-done    "$HOME/sounds/chime.wav"
+```
+
+Playback goes through the first of `pw-play`, `paplay`, `afplay`, `ffplay`,
+`canberra-gtk-play`, or `aplay` (WAV only) that exists, and falls back to the
+terminal bell if none do or the file cannot be played. A custom player overrides
+all of it:
+
+```tmux
+set -g @agentwatch-sound-command 'ffplay -nodisp -autoexit ~/sounds/$1.wav'
+```
+
+Test it without waiting for a real transition:
+
+```bash
+agentwatch sound waiting
+agentwatch doctor          # shows the mode, the player, and the resolved files
 ```
 
 ## Other agents
@@ -155,6 +212,8 @@ hook system at all need output heuristics (`monitor-silence` plus a
 - `jq` — only for `hooks --write` and for reading hook messages
 - `fzf` — only for `switch`
 - `notify-send` — only for desktop notifications
+- `pw-play` / `paplay` / `afplay` / `ffplay` / `canberra-gtk-play` / `aplay` —
+  only for sound, and only one of them
 
 ## Notes
 
